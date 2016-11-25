@@ -3,7 +3,7 @@ var device
 function initializeDevice (config) {
   process.on('message', handleMessage)
   try {
-    device = require('../../bacnet.js').init(config)
+    device = new (require('../../bacnet.js'))(config)
     device.on('iam', function (iam) {
       process.send({type: 'iam', event: iam})
     })
@@ -41,7 +41,7 @@ function handleMessage (message) {
     }
     process.removeAllListeners()
   } else { // rpc
-    device[message.method].apply(null, message.args)
+    device[message.method].apply(device, message.args)
   }
 }
 

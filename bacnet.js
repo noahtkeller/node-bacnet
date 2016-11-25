@@ -1,110 +1,120 @@
 const addon = require('./build/Release/binding.node')
-const bacnet = Object.create(addon)
+const BacnetValue = addon.BacnetValue
 const EventEmitter = require('events').EventEmitter
-const util = require('util')
-
-function BACnetInstance (config) {
-  EventEmitter.call(this)
-  const bacnetAddon = addon.init(flattenConfig(config))
-  bacnetAddon.initClient(this)
-  if (config && config.device) bacnetAddon.initDevice()
-  bacnetAddon.listen()
-
-  const confirmedCallbacks = {}
-  setupMethods.call(this, bacnetAddon, confirmedCallbacks)
-  setupHandlers.call(this, confirmedCallbacks)
-}
-
-function setupMethods (bacnetAddon, confirmedCallbacks) {
-  function addCallback (invokeId, callback) {
-    if (callback && invokeId > 0) {
-      if (typeof callback !== 'function') throw new TypeError('non-function passed as callback argument')
-      confirmedCallbacks[invokeId] = callback
-    }
-    return invokeId
-  }
-
-  this.closeQueue = bacnetAddon.closeQueue
-  this.whois = bacnetAddon.whois
-  this.isBound = bacnetAddon.isBound
-  this.readProperty = function (deviceInstance, objectType, objectInstance, property, arrayIndex, callback) {
-    if (!objectType) throw new TypeError('Expected an object type, got : ' + objectType)
-    const invokeId = bacnetAddon.readProperty(deviceInstance, bacnet.objectTypeToNumber(objectType), objectInstance, bacnet.propertyKeyToNumber(property), arrayIndex)
-    if (invokeId === 0) throw new Error('Invoking BACnet read failed')
-    return addCallback(invokeId, callback)
-  }
-  this.writeProperty = function (deviceInstance, objectType, objectInstance, property, arrayIndex, value, priority, callback) {
-    if (!objectType) throw new TypeError('Expected an object type, got : ' + objectType)
-    if (value.constructor !== bacnet.BacnetValue) {
-      value = new bacnet.BacnetValue(value)
-    }
-    // priority is optional
-    if (typeof priority === 'function') {
-      callback = priority
-      priority = undefined
-    }
-    const invokeId = bacnetAddon.writeProperty(deviceInstance, bacnet.objectTypeToNumber(objectType), objectInstance, bacnet.propertyKeyToNumber(property), arrayIndex, value, priority)
-    if (invokeId === 0) throw new Error('Invoking BACnet write failed')
-    return addCallback(invokeId, callback)
-  }
-}
-
-function setupHandlers (confirmedCallbacks) {
-  function executeCallback () {
-    const invocationCallback = confirmedCallbacks[ this ]
-    if (invocationCallback) {
-      delete confirmedCallbacks[ this ]
-      try {
-        invocationCallback.apply(null, arguments)
-      } catch (err) {
-        console.log('Error in callback', err.stack)
-        this.emit('error', err)
-      }
-    }
-  }
-
-  this.on('ack', function onAck (invokeId, response) {
-    executeCallback.call(invokeId, null, response)
-  })
-
-  this.on('abort', function onAbort (invokeId, reason) {
-    console.log('abort', invokeId)
-    executeCallback.call(invokeId, new Error(reason))
-  })
-
-  this.on('reject', function onReject (invokeId, reason) {
-    console.log('abort', invokeId)
-    executeCallback.call(invokeId, new Error(reason))
-  })
-
-  this.on('error-ack', function onErrorAck (invokeId, error) {
-    console.log('error-ack', invokeId, error)
-    executeCallback.call(invokeId, new Error('Error received in acknowledgment for request #' + invokeId + ' ' + error[ 'error-class' ] + '/' + error[ 'error-code' ]))
-  })
-}
 
 function flattenConfig (config) {
-  var flatConfig = config && config.datalink || {} // I've flattened the config as I had trouble getting nested properties in the c++
-  flatConfig.device_instance_id = config.device_instance_id
+  // I've flattened the config as I had trouble getting nested properties in the c++
+  const flatConfig = config.hasOwnProperty('dataLink') ? config.dataLink : {}
+  if (config.hasOwnProperty('device_instance_id')) {
+    flatConfig.device_instance_id = config.device_instance_id
+  }
   return flatConfig
 }
 
-util.inherits(BACnetInstance, EventEmitter)
-
-/**
- * {
- *   datalink: {
- *     iface: process.env.BACNET_INTERFACE,
- *     ip_port: process.env.BACNET_PORT || 0xBAC0
- *   },
- *   device: false,
- *   device_instance_id: 12
- * }
- * @param config
- * @returns {*|EventEmitter}
- */
-bacnet.init = function init (config) {
-  return new BACnetInstance(config)
+function addCallback (self, invokeId, callback, invocationType) {
+  if (invokeId <= 0) throw new Error(`Invoking BACnet ${invocationType} failed`)
+  if (callback !== undefined) {
+    if (typeof callback !== 'function') throw new TypeError('non-function passed as callback argument')
+    self.__callbacks[invokeId] = callback
+  }
+  return invokeId
 }
 
-module.exports = bacnet
+function executeCallback (self, invokeId, cbErr, cbRes) {
+  if (self.__callbacks.hasOwnProperty(invokeId)) {
+    const invocationCallback = self.__callbacks[invokeId]
+    delete self.__callbacks[invokeId]
+    try {
+      invocationCallback(cbErr, cbRes)
+    } catch (err) {
+      console.log('Error in callback', err.stack)
+      self.emit('error', err)
+    }
+  }
+}
+
+class Bacnet extends EventEmitter {
+
+  constructor (config) {
+    super()
+    const self = this
+
+    self.__callbacks = {}
+    self.__bacnet = addon.init(flattenConfig(config))
+
+    self.__bacnet.initClient(self)
+    if (config && config.device) {
+      self.__bacnet.initDevice()
+    }
+    self.__bacnet.listen()
+
+    self.on('ack', function onAck (invokeId, response) {
+      executeCallback(self, invokeId, null, response)
+    })
+
+    self.on('abort', function onAbort (invokeId, reason) {
+      console.log('abort', invokeId)
+      executeCallback(self, invokeId, new Error(reason))
+    })
+
+    self.on('reject', function onReject (invokeId, reason) {
+      console.log('abort', invokeId)
+      executeCallback(self, invokeId, new Error(reason))
+    })
+
+    self.on('error-ack', function onErrorAck (invokeId, error) {
+      console.log('error-ack', invokeId, error)
+      executeCallback(self, invokeId, new Error(`Error received in acknowledgment for request #${invokeId} ${error['error-class']}/${error['error-code']}`))
+    })
+  }
+
+  static get BacnetValue () {
+    return BacnetValue
+  }
+
+  static objectTypeToString () {
+    return addon.objectTypeToString.apply(addon, arguments)
+  }
+
+  static objectTypeToNumber () {
+    return addon.objectTypeToNumber.apply(addon, arguments)
+  }
+
+  static propertyKeyToString () {
+    return addon.propertyKeyToString.apply(addon, arguments)
+  }
+
+  static propertyKeyToNumber () {
+    return addon.propertyKeyToNumber.apply(addon, arguments)
+  }
+
+  closeQueue () {
+    return this.__bacnet.closeQueue.apply(this.__bacnet, arguments)
+  }
+
+  whois () {
+    return this.__bacnet.whois.apply(this.__bacnet, arguments)
+  }
+
+  // noinspection JSUnusedGlobalSymbols
+  isBound () {
+    return this.__bacnet.isBound.apply(this.__bacnet, arguments)
+  }
+
+  readProperty (deviceInstance, objectType, objectInstance, property, arrayIndex, callback = () => true) {
+    if (!objectType) throw new TypeError('Expected an object type, got : ' + objectType)
+    const invokeId = this.__bacnet.readProperty(deviceInstance, addon.objectTypeToNumber(objectType), objectInstance, addon.propertyKeyToNumber(property), arrayIndex)
+    return addCallback(this, invokeId, callback, 'read')
+  }
+
+  writeProperty (deviceInstance, objectType, objectInstance, property, arrayIndex, value, priority = () => true, callback = priority) {
+    if (!objectType) throw new TypeError('Expected an object type, got : ' + objectType)
+    value = value instanceof BacnetValue ? value : new BacnetValue(value)
+    priority = callback === priority ? undefined : priority
+    const invokeId = this.__bacnet.writeProperty(deviceInstance, addon.objectTypeToNumber(objectType), objectInstance, addon.propertyKeyToNumber(property), arrayIndex, value, priority)
+    return addCallback(this, invokeId, callback, 'write')
+  }
+
+}
+
+module.exports = Bacnet
